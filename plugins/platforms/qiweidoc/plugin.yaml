@@ -1,0 +1,36 @@
+name: qiweidoc-platform
+label: QiweiDoc (WeCom)
+kind: platform
+version: 0.1.0
+description: >
+  QiweiDoc gateway adapter for Hermes Agent.
+  Connects to a qiweidoc deployment over WebSocket for inbound WeCom group
+  messages, and dispatches outbound replies via the server-side WorkTool
+  RPA pipeline (POST /api/ai/rpa/dispatch).
+author: Lumist
+requires_env:
+  - name: QIWEIDOC_PAT
+    description: "Personal access token issued by /api/cli/whoami flow (lumist auth login)"
+    prompt: "QiweiDoc PAT"
+    password: true
+optional_env:
+  - name: QIWEIDOC_BASE_URL
+    description: "Base URL of the qiweidoc deployment (default https://x.lumiclass.com)"
+    prompt: "Base URL"
+    password: false
+  - name: QIWEIDOC_WS_PATH
+    description: "WebSocket path (default /lumist/ws)"
+    prompt: "WS path"
+    password: false
+  - name: QIWEIDOC_ALLOWED_GROUPS
+    description: "Comma-separated list of allowed group chat_id; empty = all bound groups"
+    prompt: "Allowed group chat_ids"
+    password: false
+  - name: QIWEIDOC_HOME_CHAT_ID
+    description: "Default chat_id for cron / notification delivery"
+    prompt: "Home chat_id"
+    password: false
+  - name: QIWEIDOC_REPLY_ON_ADDRESS_ONLY
+    description: "If true, only react when bot is @mentioned (default: false — react to all msgs in bound groups)"
+    prompt: "Reply only when addressed? (true/false)"
+    password: false
