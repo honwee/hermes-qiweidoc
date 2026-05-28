@@ -25,6 +25,7 @@ import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
 
 logger = logging.getLogger(__name__)
 
@@ -33,12 +34,38 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    cache_document_from_bytes,
+    cache_image_from_bytes,
 )
 from gateway.config import Platform
 
 
 _DEFAULT_BASE_URL = "https://x.lumiclass.com"
 _DEFAULT_WS_PATH = "/lumist/ws"
+
+# 企微媒体类型（与服务端 ChatSessionService::ValidMediaType 对齐）。
+# 图片/表情/文件走真正理解（下载 + 缓存 + 视觉/文档管线）；
+# 语音/视频本期只占位不转写（hermes 运行时对 voice 走 STT、无 video 分支）。
+_DOWNLOAD_MEDIA = {"image", "emotion", "file"}
+_PLACEHOLDER_MEDIA = {
+    "voice": "[语音消息]",
+    "meeting_voice_call": "[语音通话]",
+    "video": "[视频]",
+}
+_DEFAULT_EXT = {"image": "png", "emotion": "png", "file": "bin"}
+
+# hermes 运行时会把内部状态/系统消息也走 channel.send（home channel 未配、
+# 自我改进回顾、长任务进行中提示等）。这些不该出现在客户企微群里，出站侧拦掉。
+_INTERNAL_PREFIXES = (
+    "📬 No home channel is set",
+    "💾 Self-improvement review",
+    "⏳ Still working",
+)
+
+
+def _is_internal_meta(content: str) -> bool:
+    s = (content or "").strip()
+    return any(s.startswith(p) for p in _INTERNAL_PREFIXES)
 
 
 def _bool_env(name: str, default: bool = False) -> bool:
@@ -145,6 +172,11 @@ class QiweidocAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="httpx not installed; pip install httpx")
 
         meta = metadata or {}
+
+        if _is_internal_meta(content):
+            logger.info("qiweidoc: 拦截内部 meta 消息，不下发到群: %s", content[:60])
+            return SendResult(success=True, message_id="")
+
         body: Dict[str, Any] = {
             "group_id": chat_id,
             "content": content,
@@ -295,13 +327,63 @@ class QiweidocAdapter(BasePlatformAdapter):
         room_name = str(data.get("room_name") or chat_id)
         text = str(data.get("msg") or "")
         msg_id = str(data.get("msg_id") or "")
+        msg_type = str(data.get("msg_type") or "")
 
         # Ignore our own sends (echoes from WorkTool may surface here)
         if self._self_userid and from_id == self._self_userid:
             return
 
+        # 长文本回查：NOTIFY 载荷受 pg_notify 8KB 字节上限约束，触发器把正文截到
+        # ~6000 字节。若内联 msg 已接近该上限，说明被截断，按 msg_id 回查完整正文，
+        # 保证模型看到的是完整消息（短消息不触发，零额外开销）。
+        if text and len(text.encode("utf-8")) >= 5800:
+            full = await self._fetch_text(msg_id)
+            if full:
+                text = full
+
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        message_type = MessageType.TEXT
+
+        # 媒体消息：msg 文本为空或是存储 hash，按类型拉取并落 core 缓存。
         if not text.strip():
-            return
+            if msg_type in _PLACEHOLDER_MEDIA:
+                # 语音/视频：占位不转写，让 bot 知道收到但不处理音视频内容。
+                text = _PLACEHOLDER_MEDIA[msg_type]
+            elif msg_type in _DOWNLOAD_MEDIA:
+                media = await self._fetch_media(msg_id)
+                if not media or not media.get("data"):
+                    logger.info(
+                        "qiweidoc: media %s msg_id=%s unavailable, skipping", msg_type, msg_id
+                    )
+                    return
+                data_bytes = media["data"]
+                ext = "." + (str(media.get("ext") or "").lstrip(".") or _DEFAULT_EXT[msg_type])
+                mime = str(media.get("mime") or "")
+                filename = str(media.get("filename") or "")
+                try:
+                    if msg_type in ("image", "emotion"):
+                        path = cache_image_from_bytes(data_bytes, ext)
+                        media_urls = [path]
+                        media_types = [mime or "image/png"]
+                        if msg_type == "emotion":
+                            message_type = MessageType.STICKER
+                            text = "[表情]"
+                        else:
+                            message_type = MessageType.PHOTO
+                            text = "[图片]"
+                    else:  # file
+                        path = cache_document_from_bytes(data_bytes, filename or f"file{ext}")
+                        media_urls = [path]
+                        media_types = [mime or "application/octet-stream"]
+                        message_type = MessageType.DOCUMENT
+                        text = (f"[文件] {filename}").strip()
+                except Exception as e:
+                    logger.warning("qiweidoc: cache media failed (%s): %s", msg_type, e)
+                    return
+            else:
+                # 空内容且非媒体（mixed/link/weapp 等）— 维持现状跳过。
+                return
 
         if self.address_only:
             # WeCom @mention format isn't standardised in the WS payload, so we
@@ -326,14 +408,92 @@ class QiweidocAdapter(BasePlatformAdapter):
         # path can pass it back as reply_to_msg_id (dedup key on the server).
         event = MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=message_type,
             source=source,
             raw_message=data,
             message_id=msg_id or str(int(time.time() * 1000)),
+            media_urls=media_urls,
+            media_types=media_types,
             reply_to_message_id=msg_id or None,
             timestamp=_parse_ts(data.get("msg_time")),
         )
         await self.handle_message(event)
+
+    async def _fetch_media(self, msg_id: str) -> Optional[Dict[str, Any]]:
+        """GET /api/ai/media for metadata, then download the file bytes.
+
+        Returns the metadata dict with a ``data`` (bytes) key added, or None on
+        failure. The server returns a relative ``/storage/...`` url for local
+        storage and an absolute presigned url for cloud — both resolved here.
+        """
+        if not msg_id:
+            return None
+        try:
+            import httpx
+        except ImportError:
+            logger.warning("qiweidoc: httpx not installed; cannot fetch media")
+            return None
+
+        headers = {"Authorization": f"Bearer {self.pat}"}
+        meta_url = f"{self.base_url}/api/ai/media"
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.get(meta_url, params={"msg_id": msg_id}, headers=headers)
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "qiweidoc: media meta http %s: %s", resp.status_code, resp.text[:300]
+                    )
+                    return None
+                body = resp.json() or {}
+                # qiweidoc 标准响应 {status, data: {...}}；兼容直接返回。
+                meta = body.get("data") if isinstance(body.get("data"), dict) else body
+                url = str(meta.get("url") or "")
+                if not url:
+                    return None
+                file_url = urljoin(self.base_url + "/", url)
+                dl = await client.get(file_url, headers=headers)
+                if dl.status_code >= 400:
+                    logger.warning(
+                        "qiweidoc: media download http %s for msg_id=%s", dl.status_code, msg_id
+                    )
+                    return None
+                meta["data"] = dl.content
+                return meta
+        except Exception as e:
+            logger.warning("qiweidoc: media fetch error for msg_id=%s: %s", msg_id, e)
+            return None
+
+    async def _fetch_text(self, msg_id: str) -> str:
+        """GET /api/ai/message for the complete text body of a truncated message.
+
+        NOTIFY payloads are capped at pg_notify's 8 KB limit, so long messages
+        arrive trimmed; this re-fetches the full ``msg_content`` by id. Returns
+        "" on any failure so the caller falls back to the truncated inline text.
+        """
+        if not msg_id:
+            return ""
+        try:
+            import httpx
+        except ImportError:
+            logger.warning("qiweidoc: httpx not installed; cannot fetch full text")
+            return ""
+
+        headers = {"Authorization": f"Bearer {self.pat}"}
+        url = f"{self.base_url}/api/ai/message"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url, params={"msg_id": msg_id}, headers=headers)
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "qiweidoc: message http %s for msg_id=%s", resp.status_code, msg_id
+                    )
+                    return ""
+                body = resp.json() or {}
+                meta = body.get("data") if isinstance(body.get("data"), dict) else body
+                return str(meta.get("msg") or "")
+        except Exception as e:
+            logger.warning("qiweidoc: text fetch error for msg_id=%s: %s", msg_id, e)
+            return ""
 
 
 def _parse_ts(v) -> _dt.datetime:
@@ -400,6 +560,8 @@ async def _standalone_send(
     cfg = _resolve_config(extra)
     if not cfg["pat"]:
         return {"error": "qiweidoc standalone send: QIWEIDOC_PAT must be configured"}
+    if _is_internal_meta(message):
+        return {"ok": True, "skipped": "internal meta"}
     target = chat_id or cfg["home_chat_id"]
     if not target:
         return {"error": "qiweidoc standalone send: chat_id missing and no QIWEIDOC_HOME_CHAT_ID set"}
