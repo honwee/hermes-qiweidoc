@@ -1,0 +1,27 @@
+# Example model + plugin config for a hermes install running the qiweidoc channel.
+# Merge the blocks you need into ~/.hermes/config.yaml. Secrets do NOT go here —
+# the Azure key lives in ~/.hermes/.env as AZURE_FOUNDRY_API_KEY.
+
+model:
+  provider: azure-foundry
+  base_url: https://lumistai.openai.azure.com/openai/v1
+  api_mode: chat_completions
+  default: gpt-5.4
+  model: gpt-5.4
+  context_length: 400000
+  # gpt-5 series supports vision; this routes WeCom images/stickers to the
+  # model as pixels instead of degrading to text.
+  supports_vision: true
+
+# User-installed platform plugins are opt-in — qiweidoc must be listed here or
+# the gateway will not load the channel.
+plugins:
+  enabled:
+    - qiweidoc
+
+# Per-platform config (kept minimal; the adapter reads its settings from env).
+platforms:
+  qiweidoc: {}
+
+compression:
+  threshold: 0.5
