@@ -15,6 +15,21 @@ This repo is packaged as an **installable hermes plugin**: its root is the plugi
 (`plugin.yaml`, `__init__.py`, `adapter.py`), so `hermes plugins install` clones
 it straight into `~/.hermes/plugins/qiweidoc/`. No image edits, no manual copying.
 
+## 让 agent 自己装（给它这个地址即可）
+
+直接对一台装了 hermes 的机器上的 agent 说：
+
+> 安装这个 hermes 插件：https://github.com/honwee/hermes-qiweidoc
+
+agent 会执行 `hermes plugins install honwee/hermes-qiweidoc`，然后照安装后渲染的
+[`after-install.md`](./after-install.md) 把 `QIWEIDOC_PAT` / `AZURE_FOUNDRY_API_KEY`
+写进 `~/.hermes/.env`、`hermes plugins enable qiweidoc`、合并 config、`hermes gateway`。
+非交互安装会跳过 PAT 录入与 enable 询问——after-install.md 的步骤已覆盖这点。两个密钥
+（PAT、Azure key）需人提供。
+
+> 跨 hermes 版本：`register()` 会按当前 `PlatformEntry` 支持的字段过滤 kwargs，
+> 老/新版本都能加载（缺 `env_enablement_fn` 时靠 `platforms.qiweidoc.enabled: true` 启用）。
+
 ---
 
 ## 在一台新机器上部署（原生，无 Docker 镜像）
@@ -23,7 +38,8 @@ it straight into `~/.hermes/plugins/qiweidoc/`. No image edits, no manual copyin
 # 1. 原生安装 hermes（装 uv / Python 3.11 / Node / ripgrep / ffmpeg 到 ~/.hermes）
 curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
 
-# 2. 安装企微渠道（会交互提示输入 QIWEIDOC_PAT，自动写入 ~/.hermes/.env）
+# 2. 安装企微渠道（交互安装会提示输入 QIWEIDOC_PAT 并写入 ~/.hermes/.env；
+#    非交互/agent 安装会跳过，按 after-install.md 手动写 .env）
 hermes plugins install honwee/hermes-qiweidoc
 
 # 3. 配模型 + key（见安装后渲染的 after-install.md / 下面的 config.yaml.example）

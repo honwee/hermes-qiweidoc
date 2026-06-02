@@ -19,9 +19,13 @@ plugins:
   enabled:
     - qiweidoc
 
-# Per-platform config (kept minimal; the adapter reads its settings from env).
+# Per-platform config. On hermes builds with env-based auto-enable, setting
+# QIWEIDOC_PAT in ~/.hermes/.env is enough; `enabled: true` here is the
+# portable fallback for builds without that feature. The adapter reads the
+# rest of its settings from env (QIWEIDOC_BASE_URL, etc.).
 platforms:
-  qiweidoc: {}
+  qiweidoc:
+    enabled: true
 
 compression:
   threshold: 0.5

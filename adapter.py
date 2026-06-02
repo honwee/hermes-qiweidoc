@@ -592,8 +592,20 @@ async def _standalone_send(
 
 
 def register(ctx):
-    """Plugin entry point."""
-    ctx.register_platform(
+    """Plugin entry point.
+
+    Defensive against hermes-agent version drift: ``register_platform``
+    forwards extra kwargs straight into the ``PlatformEntry`` dataclass, and
+    older/newer hermes builds may not define every field this adapter sets
+    (``env_enablement_fn`` / ``cron_deliver_env_var`` / ``standalone_sender_fn``
+    are relatively new). Passing an unknown kwarg raises ``TypeError`` and the
+    whole plugin fails to load. So we filter the optional kwargs down to the
+    fields the *installed* ``PlatformEntry`` actually accepts, degrading
+    gracefully (e.g. on a build without ``env_enablement_fn`` the channel is
+    enabled via ``platforms.qiweidoc.enabled: true`` in config.yaml instead of
+    auto-enabling from env). The core kwargs are always supported.
+    """
+    kwargs = dict(
         name="qiweidoc",
         label="QiweiDoc (WeCom)",
         adapter_factory=lambda cfg: QiweidocAdapter(cfg),
@@ -617,3 +629,28 @@ def register(ctx):
             "limit and are deduped by reply_to_msg_id."
         ),
     )
+
+    # Drop kwargs this hermes build's PlatformEntry doesn't understand, so a
+    # version mismatch degrades instead of TypeError-ing the plugin out.
+    # name/label/adapter_factory/check_fn/validate_config/required_env/
+    # install_hint are explicit params of register_platform AND PlatformEntry
+    # fields, so filtering by PlatformEntry fields keeps them.
+    try:
+        import dataclasses
+
+        from gateway.platform_registry import PlatformEntry
+
+        supported = {f.name for f in dataclasses.fields(PlatformEntry)}
+        dropped = [k for k in list(kwargs) if k not in supported]
+        for k in dropped:
+            kwargs.pop(k, None)
+        if dropped:
+            logger.info(
+                "qiweidoc: this hermes-agent build's PlatformEntry lacks %s; "
+                "registering without them (version drift, non-fatal)",
+                dropped,
+            )
+    except Exception as exc:  # pragma: no cover - introspection best-effort
+        logger.debug("qiweidoc: PlatformEntry field introspection failed: %s", exc)
+
+    ctx.register_platform(**kwargs)
