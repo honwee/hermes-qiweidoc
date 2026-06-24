@@ -316,15 +316,8 @@ class QiweidocAdapter(BasePlatformAdapter):
         if not self._message_handler:
             return
 
-        chat_id = str(data.get("roomid") or "")
-        if not chat_id:
-            return  # DMs (direct) not supported in this MVP
-        if self.allowed_groups and chat_id not in self.allowed_groups:
-            return
-
         from_id = str(data.get("from") or "")
-        from_name = str(data.get("from_name") or from_id or "")
-        room_name = str(data.get("room_name") or chat_id)
+        nickname = str(data.get("nickname") or data.get("from_name") or "")
         text = str(data.get("msg") or "")
         msg_id = str(data.get("msg_id") or "")
         msg_type = str(data.get("msg_type") or "")
@@ -332,6 +325,36 @@ class QiweidocAdapter(BasePlatformAdapter):
         # Ignore our own sends (echoes from WorkTool may surface here)
         if self._self_userid and from_id == self._self_userid:
             return
+
+        chat_id = str(data.get("roomid") or "")
+        if chat_id:
+            # 群聊
+            if self.allowed_groups and chat_id not in self.allowed_groups:
+                return
+            chat_type = "group"
+            room_name = str(data.get("room_name") or nickname or chat_id)
+        else:
+            # 私聊（单聊/同事会话）：无 roomid，会话双方是 from 与 to_list。读 to 字段
+            # 确认本机器人确实是接收方再处理——self 模式网关已按绑定过滤，all 模式这里兜底。
+            # 用对端 from_id 作为会话 id（回复即发回对端）。
+            to_list = data.get("to") or []
+            if isinstance(to_list, str):
+                to_list = [to_list]
+            to_list = [str(x) for x in to_list]
+            if self._self_userid and self._self_userid not in to_list:
+                logger.debug(
+                    "qiweidoc: skip DM not addressed to us from=%s to=%s", from_id, to_list
+                )
+                return
+            chat_type = "single"
+            chat_id = from_id
+            room_name = nickname or from_id
+            logger.info(
+                "qiweidoc: inbound DM from=%s(%s) to=%s msg_id=%s",
+                from_id, nickname, to_list, msg_id,
+            )
+
+        from_name = nickname or from_id
 
         # 长文本回查：NOTIFY 载荷受 pg_notify 8KB 字节上限约束，触发器把正文截到
         # ~6000 字节。若内联 msg 已接近该上限，说明被截断，按 msg_id 回查完整正文，
@@ -385,7 +408,7 @@ class QiweidocAdapter(BasePlatformAdapter):
                 # 空内容且非媒体（mixed/link/weapp 等）— 维持现状跳过。
                 return
 
-        if self.address_only:
+        if self.address_only and chat_type == "group":
             # WeCom @mention format isn't standardised in the WS payload, so we
             # do a best-effort substring check against our user_id and a few
             # common @ markers. Operators can disable this gate by leaving
@@ -398,7 +421,7 @@ class QiweidocAdapter(BasePlatformAdapter):
         source = self.build_source(
             chat_id=chat_id,
             chat_name=room_name,
-            chat_type="group",
+            chat_type=chat_type,
             user_id=from_id,
             user_name=from_name,
             message_id=msg_id,
