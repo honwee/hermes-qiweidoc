@@ -426,6 +426,19 @@ class QiweidocAdapter(BasePlatformAdapter):
                 # 空内容且非媒体（mixed/link/weapp 等）— 维持现状跳过。
                 return
 
+        # 合并转发的聊天记录：内嵌文件/图片默认不随存档下载，flatten 文本里只有
+        # [文件 名]/[图片] 占位。这里按 msg_id 取它们的对象存储地址并拼进正文，
+        # 让模型直接拿到可下载链接（失败不阻断，正文已含占位）。
+        if msg_type == "chatrecord":
+            files = await self._fetch_chatrecord_files(msg_id)
+            if files:
+                lines = [
+                    f"[{f.get('filename') or '文件'}] {f.get('url')}"
+                    for f in files if f.get("url")
+                ]
+                if lines:
+                    text = text.rstrip() + "\n\n附件下载地址：\n" + "\n".join(lines)
+
         if self.address_only and chat_type == "group":
             # WeCom @mention format isn't standardised in the WS payload, so we
             # do a best-effort substring check against our user_id and a few
@@ -535,6 +548,39 @@ class QiweidocAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("qiweidoc: text fetch error for msg_id=%s: %s", msg_id, e)
             return ""
+
+    async def _fetch_chatrecord_files(self, msg_id: str) -> List[Dict[str, Any]]:
+        """GET /api/ai/chatrecord/files for a forwarded chatrecord's embedded files.
+
+        服务端按 sdkfileid 按需把内嵌文件/图片拉进对象存储并返回下载地址。返回
+        [{type, filename, url, ...}, ...]，任何失败都返回 [] 让正文回退到占位文本。
+        """
+        if not msg_id:
+            return []
+        try:
+            import httpx
+        except ImportError:
+            logger.warning("qiweidoc: httpx not installed; cannot fetch chatrecord files")
+            return []
+
+        headers = {"Authorization": f"Bearer {self.pat}"}
+        url = f"{self.base_url}/api/ai/chatrecord/files"
+        try:
+            # 内嵌文件首次访问会触发服务端下载，给足超时。
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.get(url, params={"msg_id": msg_id}, headers=headers)
+                if resp.status_code >= 400:
+                    logger.warning(
+                        "qiweidoc: chatrecord files http %s for msg_id=%s", resp.status_code, msg_id
+                    )
+                    return []
+                body = resp.json() or {}
+                meta = body.get("data") if isinstance(body.get("data"), dict) else body
+                files = meta.get("files") or []
+                return files if isinstance(files, list) else []
+        except Exception as e:
+            logger.warning("qiweidoc: chatrecord files fetch error for msg_id=%s: %s", msg_id, e)
+            return []
 
 
 def _parse_ts(v) -> _dt.datetime:
