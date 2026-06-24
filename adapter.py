@@ -122,6 +122,8 @@ class QiweidocAdapter(BasePlatformAdapter):
         self._recv_task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._self_userid: str = ""  # filled from ready event
+        # 入站私聊的对端 id 集合（chat_id=对端 userid）；send() 据此走单聊投递。
+        self._single_chats: set = set()
 
     @property
     def name(self) -> str:
@@ -177,10 +179,25 @@ class QiweidocAdapter(BasePlatformAdapter):
             logger.info("qiweidoc: 拦截内部 meta 消息，不下发到群: %s", content[:60])
             return SendResult(success=True, message_id="")
 
-        body: Dict[str, Any] = {
-            "group_id": chat_id,
-            "content": content,
-        }
+        # 单聊 vs 群聊：优先看入站记下的私聊对端集合；兜底用 id 前缀（群 roomid 一律
+        # wr 开头，客户/同事不是）。显式 worktool_group_name 一定按群处理。
+        is_single = (
+            not meta.get("worktool_group_name")
+            and (chat_id in self._single_chats or (bool(chat_id) and not chat_id.startswith("wr")))
+        )
+        if is_single:
+            body: Dict[str, Any] = {
+                "target_type": "single",
+                "to_userid": chat_id,
+                "content": content,
+            }
+        else:
+            body = {
+                "group_id": chat_id,
+                "content": content,
+            }
+            if meta.get("worktool_group_name"):
+                body["worktool_group_name"] = meta["worktool_group_name"]
         # Prefer explicit reply_to_msg_id from metadata, fall back to reply_to.
         # This is the inbound msg_id we are replying to — used by the server
         # for B-3 dedup so retries don't double-send.
@@ -349,6 +366,7 @@ class QiweidocAdapter(BasePlatformAdapter):
             chat_type = "single"
             chat_id = from_id
             room_name = nickname or from_id
+            self._single_chats.add(chat_id)  # 记下对端，send() 回复时走单聊
             logger.info(
                 "qiweidoc: inbound DM from=%s(%s) to=%s msg_id=%s",
                 from_id, nickname, to_list, msg_id,
